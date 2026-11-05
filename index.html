@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EnvLog 回収</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 16px; max-width: 480px; background: #fff; color: #222; }
+  button { font-size: 18px; padding: 12px 16px; margin: 4px 0; border-radius: 8px; border: 1px solid #888; background: #f4f4f4; }
+  button:disabled { opacity: 0.4; }
+  #connect, #collect { width: 100%; background: #2a6fdb; color: #fff; border: none; }
+  .info { border-top: 1px solid #ccc; border-bottom: 1px solid #ccc; padding: 8px 0; margin: 12px 0; line-height: 1.8; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #log { font-size: 13px; color: #666; white-space: pre-wrap; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #111; color: #ddd; }
+    button { background: #333; color: #ddd; }
+    #log { color: #999; }
+  }
+</style>
+</head>
+<body>
+<button id="connect">接続</button>
+<div class="info">
+  <div>状態：<span id="state">未接続</span></div>
+  <div>最新：<span id="latest">—</span></div>
+  <div>電池：<span id="batt">—</span>　エラー：<span id="err">—</span></div>
+  <div>時刻：<span id="time">—</span></div>
+  <div>受信済み：<span id="got">—</span>件 / ロガー：<span id="total">—</span>件</div>
+</div>
+<button id="collect" disabled>データ回収（CSV保存）</button>
+<div class="row">
+  <label><input type="checkbox" id="refetch"> 全件取り直す</label>
+  <button id="disconnect" disabled>切断</button>
+</div>
+<div id="log"></div>
+
+<script>
+// ロガー（firmware/EnvLogger/EnvLogger.ino）と合わせる。値はすべてリトルエンディアン
+const uuid = id => `7a1e${id}-3c5d-4f8a-9b21-6d0e4c8f2a10`;
+const UUID_SERVICE = uuid('0001');
+const UUID_STATUS  = uuid('0002');
+const UUID_TIME    = uuid('0003');
+const UUID_REQUEST = uuid('0004');
+const UUID_DATA    = uuid('0005');
+const REC = 16;
+
+const ERR_NAMES = ['SHT40', 'BH1750', 'PCF8563', '時刻未設定', 'フラッシュ', '電池少', 'WDT再起動'];
+
+// LiPoの電圧と残量の目安（おおよそ）
+const BATT_TABLE = [[4200,100],[4100,90],[4000,80],[3920,70],[3870,60],[3820,50],[3790,40],
+                    [3770,30],[3730,20],[3700,15],[3600,10],[3500,5],[3300,0]];
+
+const $ = id => document.getElementById(id);
+let device, chr = {};
+
+function log(msg) { $('log').textContent = msg; }
+
+function battPercent(mv) {
+  if (mv >= BATT_TABLE[0][0]) return 100;
+  for (let i = 1; i < BATT_TABLE.length; i++) {
+    const [v1, p1] = BATT_TABLE[i - 1], [v2, p2] = BATT_TABLE[i];
+    if (mv >= v2) return Math.round(p2 + (p1 - p2) * (mv - v2) / (v1 - v2));
+  }
+  return 0;
+}
+
+function errText(bits) {
+  return ERR_NAMES.filter((_, i) => bits & (1 << i)).join(';');
+}
+
+// UNIX時刻（UTC）→ 日本時間の文字列
+function jst(t) {
+  const d = new Date((t + 9 * 3600) * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
+         `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+// ===== IndexedDB（機器ごとに、受け取った記録をそのまま連結して保存） =====
+function openDb() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open('envlog', 1);
+    req.onupgradeneeded = () => req.result.createObjectStore('records', { keyPath: 'dev' });
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+}
+
+async function loadRecords(dev) {
+  const db = await openDb();
+  return new Promise((res, rej) => {
+    const req = db.transaction('records').objectStore('records').get(dev);
+    req.onsuccess = () => res(req.result ? new Uint8Array(req.result.data) : new Uint8Array(0));
+    req.onerror = () => rej(req.error);
+  });
+}
+
+async function saveRecords(dev, data) {
+  const db = await openDb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction('records', 'readwrite');
+    tx.objectStore('records').put({ dev, data: data.buffer });
+    tx.oncomplete = res;
+    tx.onerror = () => rej(tx.error);
+  });
+}
+
+// ===== 状態の表示 =====
+async function readStatus() {
+  const v = await chr.status.readValue();
+  return {
+    lastTime: v.getUint32(1, true),
+    temp:     v.getInt16(5, true),
+    hum:      v.getUint16(7, true),
+    battMv:   v.getUint16(9, true),
+    err:      v.getUint8(11),
+    count:    v.getUint32(14, true),
+    now:      v.getUint32(18, true),
+  };
+}
+
+function showStatus(s) {
+  const t = s.lastTime ? jst(s.lastTime).slice(0, 16) : '時刻不明';
+  const temp = s.temp === 0x7FFF ? '失敗' : (s.temp / 100).toFixed(1) + '℃';
+  const hum = s.hum === 0xFFFF ? '失敗' : (s.hum / 100).toFixed(0) + '%RH';
+  $('latest').textContent = s.count ? `${t}  ${temp}  ${hum}` : '記録なし';
+  $('batt').textContent = `${(s.battMv / 1000).toFixed(2)}V（目安 ${battPercent(s.battMv)}%）`;
+  $('err').textContent = errText(s.err) || 'なし';
+  $('total').textContent = s.count;
+}
+
+// ===== 接続 =====
+$('connect').onclick = async () => {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'EnvLog-' }],
+      optionalServices: [UUID_SERVICE],
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    $('state').textContent = '接続中…';
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(UUID_SERVICE);
+    chr.status  = await svc.getCharacteristic(UUID_STATUS);
+    chr.time    = await svc.getCharacteristic(UUID_TIME);
+    chr.request = await svc.getCharacteristic(UUID_REQUEST);
+    chr.data    = await svc.getCharacteristic(UUID_DATA);
+    $('state').textContent = `接続中（${device.name}）`;
+
+    const s = await readStatus();
+    showStatus(s);
+
+    // スマホの時刻を書き込む
+    const phoneNow = Math.floor(Date.now() / 1000);
+    const buf = new DataView(new ArrayBuffer(4));
+    buf.setUint32(0, phoneNow, true);
+    await chr.time.writeValueWithResponse(buf.buffer);
+    if (s.now === 0) {
+      $('time').textContent = 'ロガーの時刻が未設定だったので、スマホの時刻に合わせました';
+    } else {
+      const diff = s.now - phoneNow;
+      $('time').textContent = `スマホの時刻に合わせました（ずれ ${diff >= 0 ? '+' : ''}${diff}秒）`;
+    }
+
+    const got = await loadRecords(device.name);
+    $('got').textContent = got.length / REC;
+    $('collect').disabled = false;
+    $('disconnect').disabled = false;
+    log('');
+  } catch (e) {
+    log('接続できませんでした：' + e.message);
+  }
+};
+
+function onDisconnected() {
+  $('state').textContent = '切断しました';
+  $('collect').disabled = true;
+  $('disconnect').disabled = true;
+}
+
+$('disconnect').onclick = () => device && device.gatt.disconnect();
+
+// ===== データ回収 =====
+// 開始番号を書くと、ロガーが記録16バイト×n件を通知で送り、最後に4バイト（総件数）を送る
+function receiveRecords(start) {
+  return new Promise(async (resolve, reject) => {
+    const chunks = [];
+    let received = 0;
+    const onData = e => {
+      const v = e.target.value;
+      if (v.byteLength === 4) {
+        chr.data.removeEventListener('characteristicvaluechanged', onData);
+        device.removeEventListener('gattserverdisconnected', onLost);
+        const out = new Uint8Array(received);
+        let off = 0;
+        for (const c of chunks) { out.set(c, off); off += c.length; }
+        resolve(out);
+        return;
+      }
+      chunks.push(new Uint8Array(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)));
+      received += v.byteLength;
+      log(`受信中… ${start + received / REC}件`);
+    };
+    const onLost = () => reject(new Error('途中で切断されました'));
+    chr.data.addEventListener('characteristicvaluechanged', onData);
+    device.addEventListener('gattserverdisconnected', onLost);
+    try {
+      await chr.data.startNotifications();
+      const buf = new DataView(new ArrayBuffer(4));
+      buf.setUint32(0, start, true);
+      await chr.request.writeValueWithResponse(buf.buffer);
+    } catch (e) { reject(e); }
+  });
+}
+
+$('collect').onclick = async () => {
+  $('collect').disabled = true;
+  try {
+    const s = await readStatus();
+    showStatus(s);
+    let stored = await loadRecords(device.name);
+    // 全件取り直し、またはロガー側の件数のほうが少ない（フラッシュを消した）ときは最初から
+    if ($('refetch').checked || stored.length / REC > s.count) stored = new Uint8Array(0);
+    const start = stored.length / REC;
+
+    const fresh = await receiveRecords(start);
+    const all = new Uint8Array(stored.length + fresh.length);
+    all.set(stored);
+    all.set(fresh, stored.length);
+    await saveRecords(device.name, all);
+    $('got').textContent = all.length / REC;
+    $('refetch').checked = false;
+
+    downloadCsv(device.name, all);
+    log(`${fresh.length / REC}件を受け取り、CSVを保存しました`);
+  } catch (e) {
+    log('回収できませんでした：' + e.message);
+  }
+  $('collect').disabled = !device.gatt.connected;
+};
+
+// ===== CSV =====
+function parseRecords(data) {
+  const v = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const list = [];
+  for (let off = 0; off + REC <= data.length; off += REC) {
+    let sum = 0;
+    for (let i = 0; i < 15; i++) sum += data[off + i];
+    list.push({
+      ok:     (sum & 0xFF) === data[off + 15],
+      time:   v.getUint32(off, true),
+      temp:   v.getInt16(off + 4, true),
+      hum:    v.getUint16(off + 6, true),
+      lux:    v.getUint16(off + 8, true),
+      battMv: v.getUint16(off + 10, true),
+      err:    v.getUint8(off + 12),
+      leaf:   v.getUint16(off + 13, true),
+    });
+  }
+  return list;
+}
+
+// 時刻0の記録を、あとの正しい時刻から1時間ずつさかのぼって補う（仕様書 §9.4）
+function inferTimes(list) {
+  const known = r => r.ok && r.time !== 0;
+  let prevKnown = null;  // 直前の正しい時刻
+  let runStart = -1;     // 時刻が分からない記録が続き始めた位置
+  list.forEach((r, j) => {
+    if (!known(r)) {
+      if (runStart < 0) runStart = j;
+      return;
+    }
+    if (runStart >= 0) {
+      for (let k = j - 1; k >= runStart; k--) {
+        const t = r.time - 3600 * (j - k);
+        if (prevKnown !== null && t <= prevKnown) break;  // 途中で止まっていた期間があるので補わない
+        if (list[k].ok) list[k].inferred = t;
+      }
+      runStart = -1;
+    }
+    prevKnown = r.time;
+  });
+}
+
+function toCsv(data) {
+  const list = parseRecords(data);
+  inferTimes(list);
+  const lines = ['日時,温度(℃),湿度(%RH),照度(lux),葉面濡れ(生値),LiPo電圧(V),エラー'];
+  for (const r of list) {
+    if (!r.ok) { lines.push(',,,,,,記録破損'); continue; }
+    const errs = [];
+    if (r.err) errs.push(errText(r.err));
+    let when = '';
+    if (r.time) when = jst(r.time);
+    else if (r.inferred) { when = jst(r.inferred); errs.push('時刻推定'); }
+    lines.push([
+      when,
+      r.temp === 0x7FFF ? '' : (r.temp / 100).toFixed(2),
+      r.hum === 0xFFFF ? '' : (r.hum / 100).toFixed(2),
+      r.lux === 0xFFFF ? '' : r.lux,
+      r.leaf === 0xFFFF ? '' : r.leaf,
+      (r.battMv / 1000).toFixed(2),
+      errs.join(';'),
+    ].join(','));
+  }
+  return lines.join('\r\n') + '\r\n';
+}
+
+function downloadCsv(dev, data) {
+  const d = new Date();
+  const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+  // 先頭のBOMは、Excelで開いたときに文字化けしないため
+  const blob = new Blob(['﻿' + toCsv(data)], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${dev}_${ymd}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);  // すぐ消すとダウンロードが失敗することがある
+}
+
+if (!navigator.bluetooth) log('このブラウザは Web Bluetooth に対応していません（Android の Chrome で開いてください）');
+</script>
+</body>
+</html>
